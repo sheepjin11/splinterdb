@@ -339,6 +339,13 @@ typedef struct splinterdb_iterator splinterdb_iterator;
 //
 // If start_key is NULL_SLICE, the iterator will start before the minimum key
 int
+splinterdb_range_iterator_init(const splinterdb     *kvs,      // IN
+                               splinterdb_iterator **iter,     // OUT
+                               slice                 start_key, // IN
+                               uint64                num_tuples // IN
+);
+
+int
 splinterdb_iterator_init(const splinterdb     *kvs,      // IN
                          splinterdb_iterator **iter,     // OUT
                          slice                 start_key // IN

@@ -675,10 +675,10 @@ struct splinterdb_iterator {
 };
 
 int
-splinterdb_iterator_init(const splinterdb     *kvs,           // IN
-                         splinterdb_iterator **iter,          // OUT
-                         slice                 user_start_key // IN
-)
+splinterdb_range_iterator_init(const splinterdb     *kvs,
+                               splinterdb_iterator **iter,
+                               slice                 user_start_key,
+                               uint64                num_tuples)
 {
    splinterdb_iterator *it = TYPED_MALLOC(kvs->spl->heap_id, it);
    if (it == NULL) {
@@ -688,7 +688,7 @@ splinterdb_iterator_init(const splinterdb     *kvs,           // IN
    it->last_rc = STATUS_OK;
 
    core_range_iterator *range_itor = &(it->sri);
-   key                  start_key;
+   key                   start_key;
 
    if (slice_is_null(user_start_key)) {
       start_key = NEGATIVE_INFINITY_KEY;
@@ -696,21 +696,37 @@ splinterdb_iterator_init(const splinterdb     *kvs,           // IN
       start_key = key_create_from_slice(user_start_key);
    }
 
+   // NOTE: unlike the old API, num_tuples is passed through and
+   // will affect do_prefetch via CORE_PREFETCH_MIN.
    platform_status rc = core_range_iterator_init(kvs->spl,
-                                                 range_itor,
-                                                 NEGATIVE_INFINITY_KEY,
-                                                 POSITIVE_INFINITY_KEY,
-                                                 start_key,
-                                                 greater_than_or_equal,
-                                                 UINT64_MAX);
+                                                  range_itor,
+                                                  NEGATIVE_INFINITY_KEY,
+                                                  POSITIVE_INFINITY_KEY,
+                                                  start_key,
+                                                  greater_than_or_equal,
+                                                  num_tuples);
    if (!SUCCESS(rc)) {
-      platform_free(kvs->spl->heap_id, *iter);
+      platform_free(kvs->spl->heap_id, it);
       return platform_status_to_int(rc);
    }
    it->parent = kvs;
 
    *iter = it;
    return EXIT_SUCCESS;
+}
+
+
+int
+splinterdb_iterator_init(const splinterdb     *kvs,           // IN
+                         splinterdb_iterator **iter,          // OUT
+                         slice                 user_start_key // IN
+)
+{
+   // Preserve old semantics: full-range scan with "infinite" num_tuples.
+   return splinterdb_range_iterator_init(kvs,
+                                         iter,
+                                         user_start_key,
+                                         UINT64_MAX);
 }
 
 void
@@ -804,6 +820,7 @@ void
 splinterdb_stats_reset(splinterdb *kvs)
 {
    core_reset_stats(kvs->spl);
+   cache_reset_stats(kvs->spl->cc);
 }
 
 static void
