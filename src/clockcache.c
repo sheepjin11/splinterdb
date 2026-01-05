@@ -382,7 +382,9 @@ clockcache_get_ref(clockcache *cc, uint32 entry_number, uint64 counter_no)
    counter_no %= CC_RC_WIDTH;
    uint64 rc_number = clockcache_get_ref_internal(cc, entry_number);
    debug_assert(rc_number < cc->cfg->page_capacity);
-   return cc->refcount[counter_no * cc->cfg->page_capacity + rc_number];
+   // Use atomic load to ensure visibility of concurrent increments
+   return __atomic_load_n(&cc->refcount[counter_no * cc->cfg->page_capacity + rc_number],
+                          __ATOMIC_ACQUIRE);
 }
 
 static inline void
