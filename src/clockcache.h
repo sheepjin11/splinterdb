@@ -69,7 +69,7 @@ typedef uint32 entry_status; // Saved in clockcache_entry->status
  */
 struct clockcache_entry {
    page_handle           page;
-   volatile entry_status status;
+   volatile entry_status status;  // Includes binary-encoded clock bits (bits 6+)
    page_type             type;
    async_wait_queue      waiters;
 #ifdef RECORD_ACQUISITION_STACKS

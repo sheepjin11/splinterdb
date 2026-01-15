@@ -40,6 +40,21 @@
 #define CC_DEFAULT_MAX_IO_EVENTS 1
 
 /*
+ * Debug counters for clock analysis
+ */
+#define CC_COUNTDOWN_DEBUG 0
+#ifdef CC_COUNTDOWN_DEBUG
+static volatile uint64 cc_debug_set_countdown = 0;      // times clock incremented
+static volatile uint64 cc_debug_decrement = 0;          // times clock decremented
+static volatile uint64 cc_debug_evict_success = 0;      // times eviction succeeded
+static volatile uint64 cc_debug_evict_skip_countdown = 0; // times skipped due to clock > 0
+static volatile uint64 cc_debug_evict_skip_other = 0;   // times skipped due to other reasons
+// Timing counters (in nanoseconds)
+static volatile uint64 cc_debug_clock_update_time = 0;  // total time in clock update
+static volatile uint64 cc_debug_evict_time = 0;         // total time in eviction
+#endif
+
+/*
  *-----------------------------------------------------------------------------
  * Clockcache Operations Logging and Address Tracing
  *
@@ -134,43 +149,51 @@ clockcache_print(platform_log_handle *log_handle, clockcache *cc);
  *-----------------------------------------------------------------------------
  */
 #define CC_FREE        (1u << 0) // entry is free
-#define CC_ACCESSED    (1u << 1) // access bit prevents eviction for one cycle
-#define CC_CLEAN       (1u << 2) // page has no new changes
-#define CC_WRITEBACK   (1u << 3) // page is actively in writeback
-#define CC_LOADING     (1u << 4) // page is actively being read from disk
-#define CC_WRITELOCKED (1u << 5) // write lock is held
-#define CC_CLAIMED     (1u << 6) // claim is held
+#define CC_CLEAN       (1u << 1) // page has no new changes
+#define CC_WRITEBACK   (1u << 2) // page is actively in writeback
+#define CC_LOADING     (1u << 3) // page is actively being read from disk
+#define CC_WRITELOCKED (1u << 4) // write lock is held
+#define CC_CLAIMED     (1u << 5) // claim is held
+
+/*
+ * Binary clock counter in status bits (starting at bit 6)
+ * Uses atomic ADD/SUB for lock-free increment/decrement.
+ * Overflow is safe because bits 10-31 are unused.
+ *
+ * CC_CLOCK_BITS determines the range:
+ *   1-bit: 0-1 (classic CLOCK)
+ *   2-bit: 0-3
+ *   3-bit: 0-7
+ *   4-bit: 0-15
+ */
+#define CC_CLOCK_SHIFT    6
+#define CC_CLOCK_BITS     1   // 1 bit = values 0-1 (classic CLOCK)
+#define CC_CLOCK_MASK     (((1u << CC_CLOCK_BITS) - 1) << CC_CLOCK_SHIFT)
+#define CC_CLOCK_ONE      (1u << CC_CLOCK_SHIFT)  // increment unit
+#define CC_CLOCK_MAX      ((1u << CC_CLOCK_BITS) - 1)  // max value (e.g., 3 for 2-bit)
 
 /* Common status flag combinations */
 // free entry
 #define CC_FREE_STATUS (0 | CC_FREE)
 
-// evictable unlocked page
+// evictable unlocked page (clock == 0, clean) - clock checked separately
 #define CC_EVICTABLE_STATUS (0 | CC_CLEAN)
 
 // evictable locked page
 #define CC_LOCKED_EVICTABLE_STATUS (0 | CC_CLEAN | CC_CLAIMED | CC_WRITELOCKED)
 
-// accessed, but otherwise evictable page
-#define CC_ACCESSED_STATUS (0 | CC_ACCESSED | CC_CLEAN)
-
 // newly allocated page (dirty, writelocked)
 #define CC_ALLOC_STATUS (0 | CC_WRITELOCKED | CC_CLAIMED)
 
-// eligible for writeback (unaccessed)
-#define CC_CLEANABLE1_STATUS /* dirty */ (0)
+// eligible for writeback: dirty and not locked/loading
+#define CC_CLEANABLE_BASE_MASK (CC_FREE | CC_CLEAN | CC_WRITEBACK | CC_LOADING \
+                               | CC_WRITELOCKED | CC_CLAIMED)
 
-// eligible for writeback (accessed)
-#define CC_CLEANABLE2_STATUS /* dirty */ (0 | CC_ACCESSED)
+// actively in writeback
+#define CC_WRITEBACK_STATUS (0 | CC_WRITEBACK)
 
-// actively in writeback (unaccessed)
-#define CC_WRITEBACK1_STATUS (0 | CC_WRITEBACK)
-
-// actively in writeback (accessed)
-#define CC_WRITEBACK2_STATUS (0 | CC_ACCESSED | CC_WRITEBACK)
-
-// loading for read
-#define CC_READ_LOADING_STATUS (0 | CC_ACCESSED | CC_CLEAN | CC_LOADING)
+// loading for read (clock value set separately)
+#define CC_READ_LOADING_STATUS (0 | CC_CLEAN | CC_LOADING)
 
 /*
  *-----------------------------------------------------------------------------
@@ -219,6 +242,91 @@ static inline uint32
 clockcache_test_flag(clockcache *cc, uint32 entry_number, entry_status flag)
 {
    return flag & clockcache_get_status(cc, entry_number);
+}
+
+/*
+ *-----------------------------------------------------------------------------
+ * clockcache clock functions --
+ *
+ *      Clock counter for CLOCK eviction algorithm.
+ *      Stored in separate clock field (not in status) for efficient atomic ops.
+ *      No CAS loops needed - uses simple fetch_add/fetch_sub.
+ *-----------------------------------------------------------------------------
+ */
+/*
+ * Get clock value from status (binary encoded)
+ * Returns clock value (0 to CC_CLOCK_MAX)
+ */
+static inline uint32
+clockcache_get_clock(clockcache *cc, uint32 entry_number)
+{
+   uint32 status = clockcache_get_status(cc, entry_number);
+   return (status >> CC_CLOCK_SHIFT) & CC_CLOCK_MAX;
+}
+
+/*
+ * Set clock to specific value in status (binary encoded)
+ */
+static inline void
+clockcache_set_clock(clockcache *cc, uint32 entry_number, uint32 value)
+{
+   clockcache_entry *entry = clockcache_get_entry(cc, entry_number);
+   uint32 clamped = (value > CC_CLOCK_MAX) ? CC_CLOCK_MAX : value;
+   entry->status = (entry->status & ~CC_CLOCK_MASK) | (clamped << CC_CLOCK_SHIFT);
+}
+
+/*
+ * Increment clock on cache hit (hot path).
+ * Uses atomic ADD for simple lock-free increment.
+ * Overflow beyond CC_CLOCK_MAX is safe (handled in eviction).
+ */
+static inline void
+clockcache_set_clock_accessed(clockcache *cc, uint32 entry_number)
+{
+#if CC_COUNTDOWN_DEBUG
+   __sync_fetch_and_add(&cc_debug_set_countdown, 1);
+#endif
+
+   clockcache_entry *entry = clockcache_get_entry(cc, entry_number);
+   uint32 clock = (entry->status >> CC_CLOCK_SHIFT) & CC_CLOCK_MAX;
+
+   if (clock < CC_CLOCK_MAX) {
+      __atomic_fetch_add(&entry->status, CC_CLOCK_ONE, __ATOMIC_RELAXED);
+   }
+}
+
+/*
+ * Decrement clock during eviction (cold path).
+ * Uses atomic SUB for simple lock-free decrement.
+ * Returns TRUE if clock was > 0 (entry gets second chance).
+ * Returns FALSE if clock was 0 (entry can be evicted).
+ */
+static inline bool32
+clockcache_clear_clock(clockcache *cc, uint32 entry_number)
+{
+   clockcache_entry *entry = clockcache_get_entry(cc, entry_number);
+   uint32 clock = (entry->status >> CC_CLOCK_SHIFT) & CC_CLOCK_MAX;
+
+   if (clock == 0) {
+      return FALSE;  // Can be evicted
+   }
+
+   __atomic_fetch_sub(&entry->status, CC_CLOCK_ONE, __ATOMIC_RELAXED);
+
+#if CC_COUNTDOWN_DEBUG
+   __sync_fetch_and_add(&cc_debug_decrement, 1);
+#endif
+
+   return TRUE;  // Had clock > 0, gets second chance
+}
+
+/*
+ * Check if page has non-zero clock
+ */
+static inline bool32
+clockcache_has_clock(clockcache *cc, uint32 entry_number)
+{
+   return clockcache_get_clock(cc, entry_number) > 0;
 }
 
 #ifdef RECORD_ACQUISITION_STACKS
@@ -556,9 +664,10 @@ clockcache_try_get_read(clockcache *cc, uint32 entry_number, bool32 set_access)
    uint32 cc_free = clockcache_test_flag(cc, entry_number, CC_FREE);
    cc_writing     = clockcache_test_flag(cc, entry_number, CC_WRITELOCKED);
    if (LIKELY(!cc_free && !cc_writing)) {
-      // test and test and set to reduce contention
-      if (set_access && !clockcache_test_flag(cc, entry_number, CC_ACCESSED)) {
-         clockcache_set_flag(cc, entry_number, CC_ACCESSED);
+      // Increment clock on access (single atomic add, no CAS loop!)
+      // More accesses = higher clock value = more protection from eviction
+      if (set_access) {
+         clockcache_set_clock_accessed(cc, entry_number);
       }
       clockcache_record_backtrace(cc, entry_number);
       return GET_RC_SUCCESS;
@@ -778,6 +887,10 @@ failed:
  *
  *      Tests the entry to see if write back is possible. Used for test and
  *      test and set.
+ *
+ *      A page is cleanable if it is dirty (not CC_CLEAN) and not in any
+ *      locked/loading/writeback state. The clock value does not affect
+ *      writeback eligibility - it only affects eviction.
  *----------------------------------------------------------------------
  */
 static inline bool32
@@ -785,19 +898,20 @@ clockcache_ok_to_writeback(clockcache *cc,
                            uint32      entry_number,
                            bool32      with_access)
 {
+   (void)with_access;  // clock replaces accessed bit for eviction only
    uint32 status = clockcache_get_status(cc, entry_number);
-   return ((status == CC_CLEANABLE1_STATUS)
-           || (with_access && status == CC_CLEANABLE2_STATUS));
+   // Cleanable if: no flags set except possibly clock bits
+   // (dirty = not CC_CLEAN, not locked, not loading, not in writeback)
+   return (status & CC_CLEANABLE_BASE_MASK) == 0;
 }
 
 /*
  *----------------------------------------------------------------------
  * clockcache_try_set_writeback
  *
- *      Atomically sets the CC_WRITEBACK flag if the status permits; current
- *      status must be:
- *         -- CC_CLEANABLE1_STATUS (= 0)                  // dirty
- *         -- CC_CLEANABLE2_STATUS (= 0 | CC_ACCESSED)    // dirty
+ *      Atomically sets the CC_WRITEBACK flag if the status permits.
+ *      Page must be dirty and not locked/loading/in-writeback.
+ *      Clock value is preserved during writeback.
  *----------------------------------------------------------------------
  */
 static inline bool32
@@ -805,6 +919,8 @@ clockcache_try_set_writeback(clockcache *cc,
                              uint32      entry_number,
                              bool32      with_access)
 {
+   (void)with_access;  // clock replaces accessed bit for eviction only
+
    // Validate first, as we need access to volatile status * below.
    debug_assert(entry_number < cc->cfg->page_capacity,
                 "entry_number=%u is out-of-bounds. Should be < %d.",
@@ -813,20 +929,20 @@ clockcache_try_set_writeback(clockcache *cc,
 
    platform_assert(cc->entry[entry_number].waiters.head == NULL);
 
-   volatile uint32 *status = &cc->entry[entry_number].status;
-   if (__sync_bool_compare_and_swap(
-          status, CC_CLEANABLE1_STATUS, CC_WRITEBACK1_STATUS))
-   {
-      return TRUE;
-   }
+   volatile uint32 *status_ptr = &cc->entry[entry_number].status;
+   uint32 old_status, new_status;
 
-   if (with_access
-       && __sync_bool_compare_and_swap(
-          status, CC_CLEANABLE2_STATUS, CC_WRITEBACK2_STATUS))
-   {
-      return TRUE;
-   }
-   return FALSE;
+   do {
+      old_status = *status_ptr;
+      // Check if cleanable (only clock bits may be set)
+      if ((old_status & CC_CLEANABLE_BASE_MASK) != 0) {
+         return FALSE;
+      }
+      // Set writeback flag, preserve clock
+      new_status = old_status | CC_WRITEBACK;
+   } while (!__sync_bool_compare_and_swap(status_ptr, old_status, new_status));
+
+   return TRUE;
 }
 
 typedef struct async_io_state {
@@ -894,13 +1010,14 @@ clockcache_write_callback(void *wbs)
  * clockcache_batch_start_writeback --
  *
  *      Iterates through all pages in the batch and issues writeback for any
- *      which are cleanable.
+ *      which are cleanable (dirty and not locked/loading).
  *
  *      Where possible, the write is extended to the extent, including pages
  *      outside the batch.
  *
- *      If is_urgent is set, pages with CC_ACCESSED are written back, otherwise
- *      they are not.
+ *      Note: With multi-bit clock, writeback is independent of clock value.
+ *      The is_urgent parameter is kept for API compatibility but clock
+ *      only affects eviction, not writeback.
  *----------------------------------------------------------------------
  */
 void
@@ -1027,17 +1144,25 @@ clockcache_try_evict(clockcache *cc, uint32 entry_number)
    clockcache_entry *entry = clockcache_get_entry(cc, entry_number);
    const threadid    tid   = platform_get_tid();
 
-   /* store status for testing, then clear CC_ACCESSED */
-   uint32 status = entry->status;
-   /* T&T&S */
-   if (clockcache_test_flag(cc, entry_number, CC_ACCESSED)) {
-      clockcache_clear_flag(cc, entry_number, CC_ACCESSED);
+   /*
+    * Clock-based eviction: decrement clock if > 0, skip eviction
+    * Only evict when clock reaches 0
+    */
+   if (clockcache_clear_clock(cc, entry_number)) {
+      // clock was > 0, decremented, entry survives this pass
+#ifdef CC_COUNTDOWN_DEBUG
+      __sync_fetch_and_add(&cc_debug_evict_skip_countdown, 1);
+#endif
+      goto out;
    }
 
+   /* clock == 0, check other eviction conditions */
+   uint32 status = entry->status;
+
    /*
-    * perform fast tests and quit if they fail */
-   /* Note: this implicitly tests for:
-    * CC_ACCESSED, CC_CLAIMED, CC_WRITELOCK, CC_WRITEBACK
+    * perform fast tests and quit if they fail
+    * Note: this implicitly tests for:
+    * CC_CLAIMED, CC_WRITELOCK, CC_WRITEBACK
     * Note: here is where we check that the evicting thread doesn't hold a read
     * lock itself.
     */
@@ -1045,6 +1170,9 @@ clockcache_try_evict(clockcache *cc, uint32 entry_number)
        || clockcache_get_ref(cc, entry_number, tid)
        || clockcache_get_pin(cc, entry_number))
    {
+#ifdef CC_COUNTDOWN_DEBUG
+      __sync_fetch_and_add(&cc_debug_evict_skip_other, 1);
+#endif
       goto out;
    }
 
@@ -1101,10 +1229,13 @@ clockcache_try_evict(clockcache *cc, uint32 entry_number)
       clockcache_test_flag(cc, entry_number, CC_WRITELOCKED | CC_CLAIMED);
    debug_assert(debug_status);
 
-   /* 6. set status to CC_FREE_STATUS (clears claim and write lock) */
+   /* 6. set status to CC_FREE_STATUS (clears claim, write lock, and clock) */
    platform_assert(entry->waiters.head == NULL);
    entry->type   = PAGE_TYPE_INVALID;
-   entry->status = CC_FREE_STATUS;
+   entry->status = CC_FREE_STATUS;  // Also clears clock bits
+#ifdef CC_COUNTDOWN_DEBUG
+   __sync_fetch_and_add(&cc_debug_evict_success, 1);
+#endif
    clockcache_log(
       addr, entry_number, "evict: entry %u addr %lu\n", entry_number, addr);
 
@@ -1226,7 +1357,7 @@ clockcache_get_free_page(clockcache *cc,
     * not give up after 3 passes on the cache. At least wait for the
     * max latency of an IO and keep making passes.
     */
-   while (num_passes < 3
+   while (num_passes < 20  // Increased for multi-bit clock
           || (blocking && !io_max_latency_elapsed(cc->io, wait_start)))
    {
       uint64 start_entry = cc->per_thread[tid].free_hand * CC_ENTRIES_PER_BATCH;
@@ -1241,7 +1372,7 @@ clockcache_get_free_page(clockcache *cc,
                clockcache_inc_ref(cc, entry_no, tid);
             }
             platform_assert(entry->waiters.head == NULL);
-            entry->status = status;
+            entry->status = status | (CC_CLOCK_MAX << CC_CLOCK_SHIFT);  // Init with max clock
             entry->type   = type;
             debug_assert(entry->page.disk_addr == CC_UNMAPPED_ADDR);
             clockcache_record_backtrace(cc, entry_no);
@@ -1459,10 +1590,10 @@ clockcache_try_page_discard(clockcache *cc, uint64 addr)
       debug_assert(entry->page.disk_addr == addr);
       entry->page.disk_addr = CC_UNMAPPED_ADDR;
 
-      /* 6. set status to CC_FREE_STATUS (clears claim and write lock) */
+      /* 6. set status to CC_FREE_STATUS (clears claim, write lock, and clock) */
       platform_assert(entry->waiters.head == NULL);
       entry->type   = PAGE_TYPE_INVALID;
-      entry->status = CC_FREE_STATUS;
+      entry->status = CC_FREE_STATUS;  // Also clears clock bits
 
       /* 7. reset pincount */
       clockcache_reset_pin(cc, entry_number);
@@ -1599,7 +1730,7 @@ clockcache_acquire_entry_for_load(clockcache *cc, // IN
       clockcache_dec_ref(cc, entry_number, tid);
       platform_assert(entry->waiters.head == NULL);
       entry->type   = PAGE_TYPE_INVALID;
-      entry->status = CC_FREE_STATUS;
+      entry->status = CC_FREE_STATUS;  // Also clears clock bits
       clockcache_log(addr,
                      entry_number,
                      "get abort: entry: %u addr: %lu\n",
@@ -1973,10 +2104,8 @@ clockcache_unget(clockcache *cc, page_handle *page)
 
    clockcache_record_backtrace(cc, entry_number);
 
-   // T&T&S reduces contention
-   if (!clockcache_test_flag(cc, entry_number, CC_ACCESSED)) {
-      clockcache_set_flag(cc, entry_number, CC_ACCESSED);
-   }
+   // Increment clock on unget (page was used)
+   clockcache_set_clock_accessed(cc, entry_number);
 
    clockcache_log(page->disk_addr,
                   entry_number,
@@ -2428,7 +2557,7 @@ clockcache_prefetch(clockcache *cc, uint64 base_addr, page_type type)
                entry->page.disk_addr = CC_UNMAPPED_ADDR;
                entry->type           = PAGE_TYPE_INVALID;
                platform_assert(entry->waiters.head == NULL);
-               entry->status = CC_FREE_STATUS;
+               entry->status = CC_FREE_STATUS;  // Also clears clock bits
                page_off--;
             }
             break;
@@ -2644,6 +2773,32 @@ clockcache_print_stats(platform_log_handle *log_handle, clockcache *cc)
                 FRACTION_ARGS(avg_write_pages));
    // clang-format on
 
+#ifdef CC_COUNTDOWN_DEBUG
+   platform_log(log_handle, "\nBinary CLOCK Stats (%u-bit, max=%u)\n",
+                CC_CLOCK_BITS, CC_CLOCK_MAX);
+   platform_log(log_handle, "-----------------------------------------------------------------------------------------------\n");
+   platform_log(log_handle, "clock increment (accessed) : %lu\n", cc_debug_set_countdown);
+   platform_log(log_handle, "clock decrement (evict try): %lu\n", cc_debug_decrement);
+   platform_log(log_handle, "evict success              : %lu\n", cc_debug_evict_success);
+   platform_log(log_handle, "evict skip (clock > 0)     : %lu\n", cc_debug_evict_skip_countdown);
+   platform_log(log_handle, "evict skip (other reasons) : %lu\n", cc_debug_evict_skip_other);
+   platform_log(log_handle, "-----------------------------------------------------------------------------------------------\n");
+   // Timing stats
+   platform_log(log_handle, "clock update total time    : %.2f sec\n",
+                (double)cc_debug_clock_update_time / SEC_TO_NSEC(1));
+   platform_log(log_handle, "eviction total time        : %.2f sec\n",
+                (double)cc_debug_evict_time / SEC_TO_NSEC(1));
+   if (cc_debug_set_countdown > 0) {
+      platform_log(log_handle, "avg clock update time      : %.2f ns\n",
+                   (double)cc_debug_clock_update_time / cc_debug_set_countdown);
+   }
+   if (cc_debug_decrement + cc_debug_evict_success > 0) {
+      platform_log(log_handle, "avg evict check time       : %.2f ns\n",
+                   (double)cc_debug_evict_time / (cc_debug_decrement + cc_debug_evict_success));
+   }
+   platform_log(log_handle, "-----------------------------------------------------------------------------------------------\n");
+#endif
+
    allocator_print_stats(cc->al);
 }
 
@@ -2660,6 +2815,14 @@ clockcache_reset_stats(clockcache *cc)
       memset(stats->cache_miss_time_ns, 0, sizeof(stats->cache_miss_time_ns));
       memset(stats->page_writes, 0, sizeof(stats->page_writes));
    }
+
+#ifdef CC_COUNTDOWN_DEBUG
+   cc_debug_set_countdown = 0;
+   cc_debug_decrement = 0;
+   cc_debug_evict_success = 0;
+   cc_debug_evict_skip_countdown = 0;
+   cc_debug_evict_skip_other = 0;
+#endif
 }
 
 /*
@@ -3157,7 +3320,7 @@ clockcache_init(clockcache        *cc,   // OUT
       cc->entry[i].page.data =
          cc->data + clockcache_multiply_by_page_size(cc, i);
       cc->entry[i].page.disk_addr = CC_UNMAPPED_ADDR;
-      cc->entry[i].status         = CC_FREE_STATUS;
+      cc->entry[i].status         = CC_FREE_STATUS;  // Clock bits also 0
       cc->entry[i].type           = PAGE_TYPE_INVALID;
       async_wait_queue_init(&cc->entry[i].waiters);
    }
