@@ -192,8 +192,8 @@ clockcache_print(platform_log_handle *log_handle, clockcache *cc);
 // actively in writeback
 #define CC_WRITEBACK_STATUS (0 | CC_WRITEBACK)
 
-// loading for read (clock value set separately)
-#define CC_READ_LOADING_STATUS (0 | CC_CLEAN | CC_LOADING)
+// loading for read (with max clock, matching original CC_ACCESSED behavior)
+#define CC_READ_LOADING_STATUS (0 | CC_CLEAN | CC_LOADING | (CC_CLOCK_MAX << CC_CLOCK_SHIFT))
 
 /*
  *-----------------------------------------------------------------------------
@@ -1372,7 +1372,7 @@ clockcache_get_free_page(clockcache *cc,
                clockcache_inc_ref(cc, entry_no, tid);
             }
             platform_assert(entry->waiters.head == NULL);
-            entry->status = status | (CC_CLOCK_MAX << CC_CLOCK_SHIFT);  // Init with max clock
+            entry->status = status;  // Clock set via CC_READ_LOADING_STATUS or on access
             entry->type   = type;
             debug_assert(entry->page.disk_addr == CC_UNMAPPED_ADDR);
             clockcache_record_backtrace(cc, entry_no);
