@@ -889,8 +889,11 @@ failed:
  *      test and set.
  *
  *      A page is cleanable if it is dirty (not CC_CLEAN) and not in any
- *      locked/loading/writeback state. The clock value does not affect
- *      writeback eligibility - it only affects eviction.
+ *      locked/loading/writeback state.
+ *
+ *      If with_access is false (non-urgent), only pages with clock == 0
+ *      are considered cleanable. This matches the original CC_ACCESSED
+ *      behavior where recently accessed pages are not written back.
  *----------------------------------------------------------------------
  */
 static inline bool32
@@ -898,11 +901,22 @@ clockcache_ok_to_writeback(clockcache *cc,
                            uint32      entry_number,
                            bool32      with_access)
 {
-   (void)with_access;  // clock replaces accessed bit for eviction only
    uint32 status = clockcache_get_status(cc, entry_number);
-   // Cleanable if: no flags set except possibly clock bits
-   // (dirty = not CC_CLEAN, not locked, not loading, not in writeback)
-   return (status & CC_CLEANABLE_BASE_MASK) == 0;
+
+   // Base check: dirty and not locked/loading/in-writeback
+   if ((status & CC_CLEANABLE_BASE_MASK) != 0) {
+      return FALSE;
+   }
+
+   // If not urgent, only writeback pages with clock == 0 (not recently accessed)
+   if (!with_access) {
+      uint32 clock = (status >> CC_CLOCK_SHIFT) & CC_CLOCK_MAX;
+      if (clock > 0) {
+         return FALSE;
+      }
+   }
+
+   return TRUE;
 }
 
 /*
@@ -912,6 +926,9 @@ clockcache_ok_to_writeback(clockcache *cc,
  *      Atomically sets the CC_WRITEBACK flag if the status permits.
  *      Page must be dirty and not locked/loading/in-writeback.
  *      Clock value is preserved during writeback.
+ *
+ *      If with_access is false (non-urgent), only pages with clock == 0
+ *      can be written back. This matches the original CC_ACCESSED behavior.
  *----------------------------------------------------------------------
  */
 static inline bool32
@@ -919,8 +936,6 @@ clockcache_try_set_writeback(clockcache *cc,
                              uint32      entry_number,
                              bool32      with_access)
 {
-   (void)with_access;  // clock replaces accessed bit for eviction only
-
    // Validate first, as we need access to volatile status * below.
    debug_assert(entry_number < cc->cfg->page_capacity,
                 "entry_number=%u is out-of-bounds. Should be < %d.",
@@ -934,10 +949,20 @@ clockcache_try_set_writeback(clockcache *cc,
 
    do {
       old_status = *status_ptr;
-      // Check if cleanable (only clock bits may be set)
+
+      // Check if cleanable (base flags must be clear)
       if ((old_status & CC_CLEANABLE_BASE_MASK) != 0) {
          return FALSE;
       }
+
+      // If not urgent, only writeback pages with clock == 0
+      if (!with_access) {
+         uint32 clock = (old_status >> CC_CLOCK_SHIFT) & CC_CLOCK_MAX;
+         if (clock > 0) {
+            return FALSE;
+         }
+      }
+
       // Set writeback flag, preserve clock
       new_status = old_status | CC_WRITEBACK;
    } while (!__sync_bool_compare_and_swap(status_ptr, old_status, new_status));
