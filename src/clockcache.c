@@ -167,7 +167,7 @@ clockcache_print(platform_log_handle *log_handle, clockcache *cc);
  *   4-bit: 0-15
  */
 #define CC_CLOCK_SHIFT    6
-#define CC_CLOCK_BITS     1   // 1 bit = values 0-1 (classic CLOCK)
+#define CC_CLOCK_BITS     2   // 2 bits = values 0-3
 #define CC_CLOCK_MASK     (((1u << CC_CLOCK_BITS) - 1) << CC_CLOCK_SHIFT)
 #define CC_CLOCK_ONE      (1u << CC_CLOCK_SHIFT)  // increment unit
 #define CC_CLOCK_MAX      ((1u << CC_CLOCK_BITS) - 1)  // max value (e.g., 3 for 2-bit)
@@ -192,8 +192,8 @@ clockcache_print(platform_log_handle *log_handle, clockcache *cc);
 // actively in writeback
 #define CC_WRITEBACK_STATUS (0 | CC_WRITEBACK)
 
-// loading for read (with max clock, matching original CC_ACCESSED behavior)
-#define CC_READ_LOADING_STATUS (0 | CC_CLEAN | CC_LOADING | (CC_CLOCK_MAX << CC_CLOCK_SHIFT))
+// loading for read (with clock=1, incremented on subsequent accesses)
+#define CC_READ_LOADING_STATUS (0 | CC_CLEAN | CC_LOADING | (1 << CC_CLOCK_SHIFT))
 
 /*
  *-----------------------------------------------------------------------------
